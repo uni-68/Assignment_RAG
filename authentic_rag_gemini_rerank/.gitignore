@@ -1,0 +1,7 @@
+.env
+.env.password-tmp
+.venv/
+__pycache__/
+*.pyc
+authentic_rag_search_results.json
+indexed_documents.json

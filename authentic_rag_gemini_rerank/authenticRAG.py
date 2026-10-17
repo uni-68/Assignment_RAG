@@ -1,0 +1,401 @@
+# ดัดแปลงจาก aekanun2020/2025-authenticRAG ดูรายละเอียดใน README.md
+import os
+from pathlib import Path
+import json
+
+# ติดตั้ง library ที่จำเป็น
+# ติดตั้งแพ็กเกจด้วยคำสั่ง python -m pip install -r requirements.txt
+
+from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parent
+
+class AnthropicStyleContextualRAG:
+    def __init__(self, opensearch_host="localhost", opensearch_port=9200):
+        from dotenv import load_dotenv
+        from openai import OpenAI
+        from opensearchpy import OpenSearch
+        from sentence_transformers import SentenceTransformer
+        from llama_index.core import Document
+        from llama_index.core.node_parser import MarkdownNodeParser
+        load_dotenv(ROOT / ".env")
+        # รับ API key จาก environment variable
+        self.api_key = os.environ.get("GEMINI_API_KEY")
+        if not self.api_key:
+            raise ValueError("GEMINI_API_KEY environment variable not set")
+        
+        # สร้าง OpenAI client ที่ใช้เรียก Gemini API ผ่าน OpenAI-compatible endpoint
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+        )
+        
+        self.gemini_model = os.environ.get("GEMINI_MODEL", "").strip()
+        if not self.gemini_model:
+            raise ValueError("Set GEMINI_MODEL in .env to a model available to your API key")
+
+        # ตั้งค่า embedding model
+        self.embed_model = SentenceTransformer('BAAI/bge-m3')
+        self.embedding_dim = self.embed_model.get_sentence_embedding_dimension()
+        
+        # สร้าง wrapper สำหรับ embedding
+        class EmbeddingsWrapper:
+            def __init__(self, embed_model):
+                self.embed_model = embed_model
+
+            def embed_query(self, text):
+                return self.embed_model.encode(text).tolist()
+
+            def embed_documents(self, documents):
+                return [self.embed_model.encode(doc).tolist() for doc in documents]
+
+        self.encoder = EmbeddingsWrapper(self.embed_model)
+
+        # ตั้งค่าการเชื่อมต่อกับ OpenSearch
+        self.opensearch_client = OpenSearch(
+            hosts=[{'host': opensearch_host, 'port': opensearch_port}],
+            use_ssl=False
+        )
+
+        # ชื่อ indices ใน OpenSearch (แยกระหว่าง vector และ BM25 เหมือนตัวอย่าง)
+        self.vector_index_name = "once-gemini-vector-index"
+        self.bm25_index_name = "once-gemini-bm25-index"
+
+        # ค่า k สำหรับ RRF
+        self.rrf_k = 60
+
+        # ตั้งค่า MarkdownNodeParser
+        self.md_parser = MarkdownNodeParser.from_defaults()
+        
+        # สร้าง indices ถ้ายังไม่มี
+        self._create_or_update_indices()
+    
+    def _create_or_update_indices(self):
+        """สร้างหรืออัปเดต indices ที่ใช้ในการเก็บ embeddings และ BM25"""
+        # 1. สร้าง vector index
+        if not self.opensearch_client.indices.exists(index=self.vector_index_name):
+            vector_settings = {
+                "settings": {
+                    "index.knn": True,
+                    "index.knn.space_type": "cosinesimil"
+                },
+                "mappings": {
+                    "properties": {
+                        "embedding": {
+                            "type": "knn_vector",
+                            "dimension": self.embedding_dim
+                        },
+                        "doc_id": {"type": "keyword"},
+                        "content": {"type": "text"},
+                        "chunk_id": {"type": "keyword"}
+                    }
+                }
+            }
+            self.opensearch_client.indices.create(index=self.vector_index_name, body=vector_settings)
+            print(f"สร้าง vector index {self.vector_index_name} สำเร็จ")
+        
+        # 2. สร้าง BM25 index
+        if not self.opensearch_client.indices.exists(index=self.bm25_index_name):
+            bm25_settings = {
+                "settings": {
+                    "analysis": {"analyzer": {"default": {"type": "standard"}}},
+                    "similarity": {"default": {"type": "BM25"}},
+                    "index.queries.cache.enabled": False
+                },
+                "mappings": {
+                    "properties": {
+                        "content": {"type": "text", "analyzer": "standard"},
+                        "contextualized_content": {"type": "text", "analyzer": "standard"},
+                        "doc_id": {"type": "keyword"},
+                        "chunk_id": {"type": "keyword"},
+                        "original_index": {"type": "integer", "index": False}
+                    }
+                }
+            }
+            self.opensearch_client.indices.create(index=self.bm25_index_name, body=bm25_settings)
+            print(f"สร้าง BM25 index {self.bm25_index_name} สำเร็จ")
+
+    def call_gemini_api(self, prompt, max_tokens=500, temperature=0.2):
+        """เรียกใช้ Gemini API เพื่อสร้างข้อความ"""
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.gemini_model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            text = completion.choices[0].message.content
+            if not text or not text.strip():
+                raise RuntimeError("Gemini returned empty text; inspect model and token limit")
+            return text
+        except Exception as e:
+            print(f"Error calling Gemini API: {e}")
+            raise RuntimeError("Gemini request failed; no error text will be indexed") from e
+
+    def load_documents(self, md_paths):
+        from llama_index.core import Document
+        """โหลดเอกสาร Markdown และแบ่งเป็น chunks"""
+        print(f"Loading documents from {len(md_paths)} files...")
+        
+        # แบ่งข้อความตามหัวข้อ Markdown โดยไม่แปลงเอกสารผ่าน LangChain
+        llama_docs = [
+            Document(text=Path(path).read_text(encoding="utf-8"),
+                     metadata={"source": str(path)})
+            for path in md_paths
+        ]
+        chunks = self.md_parser.get_nodes_from_documents(llama_docs)
+        print(f"Split documents into {len(chunks)} chunks")
+        return [SimpleNamespace(page_content=node.text, metadata=node.metadata)
+                for node in chunks]
+
+    def get_context_prompt(self, document_content, chunk_content):
+        """สร้าง prompt สำหรับการสร้างบริบท (เหมือนในตัวอย่าง Anthropic)"""
+        prompt = f"""<document>
+{document_content}
+</document>
+
+Here is the chunk we want to situate within the whole document:
+<chunk>
+{chunk_content}
+</chunk>
+
+Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval. Answer only with the succinct context and nothing else.
+"""
+        return prompt
+
+    def generate_context(self, document_content, chunk_content):
+        """สร้างบริบทโดยใช้ Gemini API"""
+        prompt = self.get_context_prompt(document_content, chunk_content)
+        context = self.call_gemini_api(prompt, max_tokens=100, temperature=0.1)
+        return context.strip()
+
+    def add_documents_with_context(self, docs):
+        """เพิ่มเอกสารเข้า OpenSearch พร้อมบริบทเสริม (แบบที่ทำในตัวอย่าง)"""
+        print(f"\nAdding {len(docs)} documents to OpenSearch with contextual information...")
+
+        # 1. เตรียมข้อมูลสำหรับ vector index
+        vector_bulk_data = []
+        
+        # 2. เตรียมข้อมูลสำหรับ BM25 index
+        bm25_bulk_data = []
+
+        for i, doc in enumerate(docs):
+            # หาเอกสารเต็ม
+            doc_source = doc.metadata.get("source", "")
+            full_doc_content = doc.page_content  # ถ้าไม่มีเอกสารเต็ม ใช้ chunk เอง
+            
+            # สร้างบริบทสำหรับ chunk นี้
+            context = self.generate_context(full_doc_content, doc.page_content)
+            print(f"Generated context for chunk {i+1}/{len(docs)}: {context[:50]}...")
+            
+            # สร้าง contextualized content โดยรวมเนื้อหาและบริบทเข้าด้วยกัน (สำหรับ embedding)
+            contextualized_content = f"{doc.page_content}\n\n{context}"
+            
+            # สร้าง vector embedding จาก contextualized content
+            embedding = self.encoder.embed_query(contextualized_content)
+            
+            # เตรียมข้อมูลสำหรับ vector index
+            vector_doc = {
+                "index": {
+                    "_index": self.vector_index_name,
+                    "_id": f"doc_{i}"
+                }
+            }
+            vector_data = {
+                "embedding": embedding,
+                "doc_id": f"doc_{i}",
+                "content": doc.page_content,
+                "chunk_id": i
+            }
+            vector_bulk_data.append(vector_doc)
+            vector_bulk_data.append(vector_data)
+            
+            # เตรียมข้อมูลสำหรับ BM25 index
+            bm25_doc = {
+                "index": {
+                    "_index": self.bm25_index_name,
+                    "_id": f"doc_{i}"
+                }
+            }
+            bm25_data = {
+                "content": doc.page_content,
+                "contextualized_content": context,  # เก็บแยกเหมือนตัวอย่าง
+                "doc_id": f"doc_{i}",
+                "chunk_id": i,
+                "original_index": i
+            }
+            bm25_bulk_data.append(bm25_doc)
+            bm25_bulk_data.append(bm25_data)
+
+        # อัปโหลด vector data
+        if vector_bulk_data:
+            response = self.opensearch_client.bulk(body=vector_bulk_data)
+            if response.get("errors", True):
+                raise RuntimeError("Vector bulk upload failed; inspect OpenSearch response")
+            else:
+                print(f"Successfully added {len(docs)} documents to vector index")
+            self.opensearch_client.indices.refresh(index=self.vector_index_name)
+            
+        # อัปโหลด BM25 data
+        if bm25_bulk_data:
+            response = self.opensearch_client.bulk(body=bm25_bulk_data)
+            if response.get("errors", True):
+                raise RuntimeError("BM25 bulk upload failed; inspect OpenSearch response")
+            else:
+                print(f"Successfully added {len(docs)} documents to BM25 index")
+            self.opensearch_client.indices.refresh(index=self.bm25_index_name)
+
+        return len(docs)
+
+    def sparse_search(self, query, k=10):
+        """ค้นหาด้วย BM25 (คล้ายตัวอย่าง)"""
+        response = self.opensearch_client.search(
+            index=self.bm25_index_name,
+            body={
+                "query": {
+                    "multi_match": {
+                        "query": query,
+                        "fields": ["content", "contextualized_content"],
+                        "type": "best_fields"
+                    }
+                },
+                "size": k
+            }
+        )
+
+        return [(hit["_id"], hit["_score"], hit["_source"]) for hit in response["hits"]["hits"]]
+
+    def dense_search(self, query, k=10):
+        """ค้นหาด้วย vector similarity"""
+        query_embedding = self.encoder.embed_query(query)
+
+        response = self.opensearch_client.search(
+            index=self.vector_index_name,
+            body={
+                "query": {
+                    "knn": {
+                        "embedding": {
+                            "vector": query_embedding,
+                            "k": k
+                        }
+                    }
+                },
+                "size": k
+            }
+        )
+
+        return [(hit["_id"], hit["_score"], hit["_source"]) for hit in response["hits"]["hits"]]
+
+    def rrf_fusion(self, rankings, k=60):
+        """ผสมผลลัพธ์การค้นหาด้วย Reciprocal Rank Fusion (เหมือนในตัวอย่าง)"""
+        fused_scores = {}
+        doc_sources = {}
+
+        for ranker_id, results in enumerate(rankings):
+            for rank, (doc_id, score, source) in enumerate(results):
+                if doc_id not in fused_scores:
+                    fused_scores[doc_id] = 0
+                    doc_sources[doc_id] = source
+
+                # สูตรรวมอันดับ RRF: 1 / (k + rank) โดยอันดับเริ่มที่ 0
+                fused_scores[doc_id] += 1.0 / (k + rank)
+
+        # เรียงลำดับตาม RRF score
+        sorted_results = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+        return [(doc_id, score, doc_sources[doc_id]) for doc_id, score in sorted_results]
+
+    def hybrid_search(self, query, k=5, rrf_k=60):
+        """ค้นหาแบบ hybrid ด้วย RRF ที่รวมผลจาก sparse และ dense search (เหมือนตัวอย่าง)"""
+        # ค้นหาด้วย BM25 (sparse)
+        sparse_results = self.sparse_search(query, k=k*2)
+        print(f"\nSparse search found {len(sparse_results)} results")
+
+        # ค้นหาด้วย vector similarity (dense)
+        dense_results = self.dense_search(query, k=k*2)
+        print(f"Dense search found {len(dense_results)} results")
+
+        # ใช้ RRF ผสมผลลัพธ์
+        rankings = [sparse_results, dense_results]
+        fused_results = self.rrf_fusion(rankings, k=rrf_k)
+        print(f"RRF fusion returned {len(fused_results)} results")
+
+        return fused_results[:k]
+
+    def truncate_context(self, context, max_tokens=4000):
+        """ย่อ context ให้มีขนาดไม่เกิน max_tokens"""
+        words = context.split()
+        estimated_tokens = len(words) * 1.3
+        
+        if estimated_tokens <= max_tokens:
+            return context
+        
+        target_words = int(max_tokens / 1.3)
+        truncated_context = " ".join(words[:target_words])
+        return truncated_context + " ...(truncated)"
+
+    def search_for_question(self, question, k=5):
+        """ค้นหาเอกสารที่เกี่ยวข้องกับคำถามและสร้างคำตอบ"""
+        results = self.hybrid_search(question, k=k)
+
+        if not results:
+            return self.generate_response(question)
+
+        # แสดงเอกสารที่พบและใช้เนื้อหาเป็น context
+        context = ""
+        print(f"\nFound {len(results)} relevant documents for question: '{question}'")
+        for i, (doc_id, score, doc) in enumerate(results, 1):
+            print(f"\nDOCUMENT {i}/{len(results)}")
+            print(f"Score: {score}")
+            print(f"Doc ID: {doc_id}")
+
+            # แสดงบริบทที่สร้างขึ้น
+            if "contextualized_content" in doc:
+                print(f"Context: {doc['contextualized_content']}")
+
+            # แสดงเนื้อหาเฉพาะเอกสารแรก
+            if i == 1:
+                print("\nContent:")
+                content = doc.get("content", "")
+                if len(content) > 500:
+                    print(content[:500] + "...(truncated)")
+                else:
+                    print(content)
+
+            # เพิ่มเนื้อหาและบริบทเข้าไปใน context
+            content = doc.get("content", "")
+            context_info = doc.get("contextualized_content", "")
+            context += f"Content: {content}\nContext: {context_info}\n\n"
+
+        # ย่อ context ถ้าจำเป็น
+        truncated_context = self.truncate_context(context)
+        
+        # สร้างคำตอบจาก context
+        return self.generate_response(question, truncated_context)
+
+    def generate_response(self, question, context="", max_tokens=1000):
+        """สร้างคำตอบจากคำถามและ context"""
+        if not context:
+            prompt = f"""You are a question answering assistant. Answer the question as truthful and helpful as possible.
+
+Question: {question}"""
+        else:
+            prompt = f"""You are a question answering assistant. Answer the question as truthful and helpful as possible.
+
+Context information:
+{context}
+
+Question: {question}"""
+
+        return self.call_gemini_api(prompt, max_tokens=max_tokens, temperature=0.6)
+
+
+def main():
+    from app import ingest
+    return ingest()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,22 @@
+# ค่าลับและการตั้งค่าของแต่ละเครื่อง
+.env
+.env.*
+!.env.example
+*.password-tmp
+
+# สภาพแวดล้อมและไฟล์ชั่วคราวของ Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ผลลัพธ์ที่สร้างบนเครื่อง
+authentic_rag_search_results.json
+indexed_documents.json
+
+# เครื่องมือและไฟล์ระบบ
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
